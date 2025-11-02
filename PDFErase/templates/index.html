@@ -1,0 +1,188 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PDF Eraser — Clean</title>
+  <style>
+    body{font-family:sans-serif;background:#f4f4f6;margin:0;padding:12px;text-align:center;}
+    #toolbar{display:flex;gap:10px;justify-content:center;align-items:center;margin-bottom:10px;}
+    canvas{border:1px solid #ccc;box-shadow:0 6px 18px rgba(0,0,0,0.06);cursor:crosshair;display:block;margin:0 auto;}
+    button,input{padding:8px 12px;border-radius:6px;border:1px solid #ddd;background:white;}
+    #pageLabel{font-weight:600;}
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <input id="fileInput" type="file" accept="application/pdf">
+    <button id="prevBtn">Prev</button>
+    <span id="pageLabel">Page 0/0</span>
+    <button id="nextBtn">Next</button>
+    <button id="saveBtn">Save</button>
+  </div>
+
+  <canvas id="pdfCanvas"></canvas>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <script>
+    // pdf.js worker (CDN)
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+    const fileInput = document.getElementById('fileInput');
+    const canvas = document.getElementById('pdfCanvas');
+    const ctx = canvas.getContext('2d');
+    const prevBtn = document.getElementById('prevBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const saveBtn = document.getElementById('saveBtn');
+    const pageLabel = document.getElementById('pageLabel');
+
+    let pdfDoc = null;
+    let localFile = null;               // File object used for front rendering
+    let serverFilename = "";            // name returned by server (stored there)
+    let pageNum = 1;
+    let scale = 1.4;
+
+    // Edited canvases: we store per-page a separate HTMLCanvasElement (same size as pdf canvas)
+    // If a page is not edited, it won't be in editedMap.
+    const editedMap = {}; // pageIndex (0-based) -> dataURL
+
+    fileInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      localFile = file;
+
+      // upload to server to save original copy and get pagecount
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch('/upload', { method: 'POST', body: form });
+      const json = await res.json();
+      if (json.error) { alert("Upload failed: " + json.error); return; }
+      serverFilename = json.filename;
+
+      // load locally in pdf.js for instant rendering/navigation
+      const arrayBuf = await file.arrayBuffer();
+      pdfDoc = await pdfjsLib.getDocument({data: arrayBuf}).promise;
+      pageNum = 1;
+      editedMapClear();
+      renderPage(pageNum);
+    });
+
+    function editedMapClear() {
+      for (const k in editedMap) delete editedMap[k];
+    }
+
+    async function renderPage(num) {
+      if (!pdfDoc) return;
+      const page = await pdfDoc.getPage(num);
+      const viewport = page.getViewport({ scale: scale });
+      canvas.width = Math.floor(viewport.width);
+      canvas.height = Math.floor(viewport.height);
+
+      // render base page
+      const renderCtx = {
+        canvasContext: ctx,
+        viewport: viewport
+      };
+      await page.render(renderCtx).promise;
+
+      // if page has edits, draw them on top
+      const idx = num - 1;
+      if (editedMap[idx]) {
+        const img = new Image();
+        img.src = editedMap[idx];
+        await new Promise(r => img.onload = r);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      }
+
+      pageLabel.textContent = `Page ${num} / ${pdfDoc.numPages}`;
+    }
+
+    prevBtn.onclick = () => {
+      if (!pdfDoc) return;
+      if (pageNum <= 1) return;
+      pageNum--;
+      renderPage(pageNum);
+    };
+    nextBtn.onclick = () => {
+      if (!pdfDoc) return;
+      if (pageNum >= pdfDoc.numPages) return;
+      pageNum++;
+      renderPage(pageNum);
+    };
+
+    // DRAW/ERASE overlay: we'll capture mouse drag and erase (draw white) onto an offscreen canvas,
+    // then save that offscreen canvas as editedMap[pageIndex]
+    let isDrawing = false, sx=0, sy=0;
+
+    canvas.addEventListener('mousedown', (e)=>{
+      if (!pdfDoc) return;
+      isDrawing = true;
+      const rect = canvas.getBoundingClientRect();
+      sx = e.clientX - rect.left;
+      sy = e.clientY - rect.top;
+    });
+
+    canvas.addEventListener('mousemove', (e)=>{
+      if (!isDrawing) return;
+      // dynamic visual: re-render page then draw translucent box to indicate area
+      const rect = canvas.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      // redraw page to clear previous rectangle
+      renderPage(pageNum).then(()=>{
+        ctx.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx.fillRect(sx, sy, cx - sx, cy - sy);
+        ctx.strokeStyle = 'rgba(200,0,0,0.8)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sx, sy, cx - sx, cy - sy);
+      });
+    });
+
+    canvas.addEventListener('mouseup', async (e)=>{
+      if (!isDrawing) return;
+      isDrawing = false;
+      const rect = canvas.getBoundingClientRect();
+      const ex = e.clientX - rect.left;
+      const ey = e.clientY - rect.top;
+
+      // get current full-page image (base page + existing edits)
+      await renderPage(pageNum);
+      // draw the final white rectangle permanently on the canvas
+      const x0 = Math.min(sx, ex), y0 = Math.min(sy, ey);
+      const x1 = Math.max(sx, ex), y1 = Math.max(sy, ey);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+
+      // save current canvas as dataURL into editedMap for this page
+      const dataURL = canvas.toDataURL('image/png');
+      editedMap[pageNum - 1] = dataURL;
+    });
+
+    // Save: send editedMap entries to server, server rebuilds PDF
+    saveBtn.onclick = async () => {
+      if (!serverFilename) { alert("Upload first"); return; }
+
+      const editedList = Object.keys(editedMap).map(k => ({
+        page: Number(k),
+        data: editedMap[k]
+      }));
+
+      const payload = { filename: serverFilename, edited: editedList };
+      // note: server expects JSON {filename, edited}
+      const res = await fetch('/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) { alert("Save failed"); return; }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'edited.pdf';
+      a.click();
+    };
+  </script>
+</body>
+</html>
